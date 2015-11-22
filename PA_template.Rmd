@@ -1,0 +1,278 @@
+---
+title: "Analysis of Weight Lifting Exercises Dataset"
+author: VeryFatBoy
+output:
+  html_document:
+    keep_md: true
+---
+
+## Executive summary
+
+In this project, we use data from accelerometers on the belt, forearm, arm, and dumbbell of six participants. These participants were asked to perform barbell lifts correctly and incorrectly in five different ways, as follows [1]:
+
+* Class A: exactly according to the specification
+* Class B: throwing the elbows to the front
+* Class C: lifting the dumbbell only halfway
+* Class D: lowering the dumbbell only halfway
+* Class E: throwing the hips to the front
+
+Class A represented the correct execution of the exercise. The other four represented common mistakes. The goal was to quantify how well the participants did the barbell lifts. More information about the original experiments is available from [1].
+
+The goal of our project is to predict the manner in which the participants did the exercise. This is the **classe** variable in the training set. We will use other variables to predict with. This report describes how the model was built, cross-validation, the out of sample error, and the reasons for particular choices. We will also use our prediction model to predict 20 different test cases.
+
+## Loading and preprocessing the data
+
+Let's begin by performing the prep work, such as loading libraries, loading data, and performing data transformation.
+
+```{r, echo = TRUE, eval = TRUE, message = FALSE, warning = FALSE}
+# Load libraries
+library(caret)
+library(corrplot)
+library(doParallel)
+library(gplots)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(RColorBrewer)
+
+# Set the seed
+set.seed(1234)
+
+# Set digits option
+options(digits = 12)
+
+na_values <- c("", "NA", "#DIV/0!")
+
+# Download the training data set
+file <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+if (!file.exists("pml-training.csv"))
+  download.file(file, destfile = "pml-training.csv", method = "curl")
+
+# Load the training data set
+pml_training_data <- read.csv("pml-training.csv",
+                              header = TRUE,
+                              sep = ",",
+                              na.strings = na_values)
+
+# Download the test data set
+file <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+if (!file.exists("pml-testing.csv"))
+  download.file(file, destfile = "pml-testing.csv", method = "curl")
+
+# Load the test data set
+pml_test_data <- read.csv("pml-testing.csv",
+                          header = TRUE,
+                          sep = ",",
+                          na.strings = na_values)
+
+# Check the data
+dim(pml_training_data)
+dim(pml_test_data)
+```
+
+Examining the data, there are many columns with missing values. So, we will remove these using **transpose**.
+
+```{r, echo = TRUE, eval = TRUE}
+# Ignore "", NA and #DIV/0! using transpose
+pml_training_data <- pml_training_data[,complete.cases(t(pml_training_data))]
+pml_test_data <- pml_test_data[,complete.cases(t(pml_test_data))]
+
+# Check the data
+dim(pml_training_data)
+dim(pml_test_data)
+```
+
+This removes 100 columns. Now let's see the remaining columns.
+
+```{r, echo = TRUE, eval = TRUE}
+colnames(pml_training_data)
+colnames(pml_test_data)
+```
+
+Next, we will remove the following columns that are not important for Machine Learning:
+
+* X (row number)
+* user\_name
+* raw\_timestamp\_part\_1
+* raw\_timestamp\_part\_2
+* cvtd\_timestamp
+* new\_window
+* num\_window
+* problem\_id
+
+```{r, echo = TRUE, eval = TRUE}
+# Remove fields listed above
+columns_to_remove = c("X",
+                      "user_name",
+                      "raw_timestamp_part_1",
+                      "raw_timestamp_part_2",
+                      "cvtd_timestamp",
+                      "new_window",
+                      "num_window",
+                      "problem_id")
+
+pml_training_data <- pml_training_data[, -which(names(pml_training_data) %in% columns_to_remove)]
+pml_test_data <- pml_test_data[, -which(names(pml_test_data) %in% columns_to_remove)]
+```
+
+Next, we will check for near-zero variance to find additional candidate columns to remove.
+
+```{r, echo = TRUE, eval = TRUE}
+near_zero_var <- nearZeroVar(pml_training_data, saveMetrics = TRUE)
+if (any(near_zero_var$nzv)) nzv else
+  message("No near zero variance in training data")
+
+near_zero_var <- nearZeroVar(pml_test_data, saveMetrics = TRUE)
+if (any(near_zero_var$nzv)) nzv else
+  message("No near zero variance in test data")
+```
+
+The results show no candidates. So, we are left with 53 columns. That is 52 predictors and 1 outcome (classe). This is still a large number of predictors and we can perform additional analysis to try and reduce this number.
+
+Let's check the data as a heatmap with dendograms, to determine any correlation or clustering of variables. The following heatmap shows that there are dark squares (blue, red), so there is some correlation.
+
+```{r heatmap, echo = TRUE, eval = TRUE}
+plot_data <- cor(subset(pml_training_data, select = -classe))
+plot_color <- colorRampPalette(c("darkblue",
+                                 "blue",
+                                 "lightblue",
+                                 "lightyellow",
+                                 "orange",
+                                 "red",
+                                 "darkred"))(n = 100)
+heatmap.2(plot_data,
+          col = plot_color,
+          dendrogram = "both",
+          density.info = "none",
+          trace = "none",
+          margins = c(5, 10),
+          key = TRUE,
+          scale = "none",
+          cexRow = 0.5,
+          cexCol = 0.5)
+```
+
+We can remove strongly correlated variables.
+
+```{r, echo = TRUE, eval = TRUE}
+plot_data <- findCorrelation(plot_data, cutoff = 0.5)
+pml_training_data <- pml_training_data[, -plot_data]
+dim(pml_training_data)
+```
+
+We now have 22 columns. That is 21 predictors and 1 outcome (classe). Now that we have fewer predictors, we avoid overfitting. Also, with a better model, the out of sample error should be quite low. The expectation is that it will be within 1-2%.
+
+Let's now check the correlation more closely with a correlation plot.
+
+```{r correlation, echo = TRUE, eval = TRUE}
+plot_data <- cor(subset(pml_training_data, select = -classe))
+corrplot(plot_data,
+         method = "color",
+         col = plot_color,
+         type = "lower",
+         order = "hclust",
+         tl.cex = 0.5,
+         tl.col = "black",
+         tl.srt = 45)
+```
+
+We can see now that there are no significant correlations.
+
+## Training fitness model
+
+Let's now partition our data into training and testing data sets. We will use a 60% training and 40% testing split using the rules of thumb guide from the course lecture "Prediction Study Design" [2].
+
+```{r, echo = TRUE, eval = TRUE, cache = TRUE, cache = TRUE}
+pml_training_partition <- createDataPartition(pml_training_data$classe, p = 0.6, list = FALSE)
+training <- pml_training_data[pml_training_partition,]
+testing <- pml_training_data[-pml_training_partition,]
+```
+
+We can see the training model graphically, as follows.
+
+```{r tree, echo = TRUE, eval = TRUE}
+prp(rpart(classe ~ ., data = training, method = "class"))
+```
+
+Initial thoughts were to use several different predictors. However experimental results showed that considerable time was required to complete all of them, so it was decided to focus just on random forest. Random forest provides high levels of accuracy. We will use 3-fold cross-validation, as suggested in a Coursera discussion thread [3].
+
+```{r, echo = TRUE, eval = TRUE, cache = TRUE}
+registerDoParallel()
+rf_fit <- train(training$classe ~ .,
+                data = training,
+                method = "rf",
+                trControl = trainControl(method = "cv", number = 3),
+                allowParallel = TRUE,
+                prox = TRUE)
+rf_fit
+```
+
+Here is the model summary.
+
+```{r, echo = TRUE, eval = TRUE}
+rf_fit$finalModel
+```
+
+We can see that the out of bag (OOB) error rate is quite low.
+
+We can check the most important variables.
+
+```{r, echo = TRUE, eval = TRUE}
+varImp(rf_fit)
+```
+
+## Cross-validation
+
+For completeness, we will undertake a separate cross-validation.
+
+```{r, echo = TRUE, eval = TRUE, cache = TRUE}
+rf_prediction = predict(rf_fit, testing)
+confusionMatrix(rf_prediction, testing$classe)
+```
+
+The accuracy of the model is shown above, and can also be calculated as follows.
+
+```{r, echo = TRUE, eval = TRUE}
+rf_accuracy <- sum(rf_prediction == testing$classe) / length(testing$classe)
+rf_accuracy
+```
+
+This is approximately 98%. The out of sample error can be calculated as follows.
+
+```{r, echo = TRUE, eval = TRUE}
+1 - rf_accuracy
+```
+
+This is approximately 2%.
+
+## Predicting with the test data
+
+```{r, echo = TRUE, eval = TRUE, cache = TRUE}
+answers = predict(rf_fit, pml_test_data)
+answers
+```
+
+## Writing out the Coursera data files
+
+```{r, echo = TRUE, eval = TRUE}
+# Write out the results
+pml_write_files = function(x) {
+  n = length(x)
+  for (i in 1:n) {
+    filename = paste0("answers/problem_id_", i, ".txt")
+    write.table(x[i], file = filename, quote = FALSE, row.names = FALSE, col.names = FALSE)
+  }
+}
+
+pml_write_files(answers)
+```
+
+The answers were submitted to Coursera and found to be 100% correct.
+
+## References
+
+[1] http://groupware.les.inf.puc-rio.br/har
+
+[2] https://class.coursera.org/predmachlearn-034/lecture/13
+
+[3] https://class.coursera.org/predmachlearn-034/forum/thread?thread_id=11
